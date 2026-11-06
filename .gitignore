@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+result
+result-*
+.direnv/
+.env
+*.pem
+*.auth
+*.img
+*.qcow2
+bundle*.json

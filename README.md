@@ -18,13 +18,18 @@ phase closure. Its old independent FIDO2 slot was retired after validation.
 That was unsigned systemd-boot with an emulated CanoKey, **not** proof of physical
 Solo touch, a Secure Boot chain, or physical TPM antirollback.
 
-This version preserves the prototype's v1 policy reference and AES-GCM AAD for
-existing sealed bundles. The policy reference still contains the historical
-`nixos-trial` namespace. PCR4/7/9 are defaults, not a universally correct policy.
-The phase profile specifically requires initially-zero SHA256 PCR11, checks it
-AFTER PolicyAuthorize, and extends it before switch-root. It is not validated
-for Lanzaboote/UKIs or hibernation. Do not treat enabling the module as secure
-physical provisioning.
+Version 1 preserves the prototype's historical `nixos-trial` policy reference
+and AES-GCM AAD for existing bundles. It defaults to PCR4/7/9 and requires
+initially-zero PCR11 AFTER PolicyAuthorize. This legacy profile cannot be used
+unchanged for a measured UKI.
+
+Version 2 adds a distinct UKI policy reference, PCR4/7/11 approvals calculated
+before boot, multiple approvals per epoch, and a mandatory zero-PCR15 early-phase
+guard after PolicyAuthorize/NV. The originating VM has boot-tested two signed
+systemd-stub UKIs, exact predicted PCRs, first-boot automatic unlock, rejection of
+a changed UKI, and late-unseal denial. Firmware Secure Boot enforcement is still
+disabled there; signing and install-time signature verification do not establish
+firmware enforcement. Hibernation and physical provisioning remain unvalidated.
 
 ## Package and module
 
@@ -135,10 +140,45 @@ slot addition can leave a new slot without a final bundle: preserve recovery,
 inspect the state and clean up explicitly, rather than overwrite/re-enroll.
 
 The generic tool does not advance epochs, rotate/reseal enrollments, delete TPM
-objects, or retire old slots. Transactional epoch activation, offline approval
+objects, or retire old slots. Transactional epoch activation, production offline approval
 workflows and hardware-backed NV lifecycle policies still need implementation
 and validation. Epoch advancement revokes automatic unsealing, not EFI execution.
 Python/subprocess memory is not guaranteed zeroized.
+
+## UKI profile (version 2)
+
+Enroll a distinct free slot with `enroll --profile uki`; the prior slots are
+preserved. The new bundle initially has **no approvals**. Configure the consuming
+initrd with `boot.initrd.combinedUnlock.phasePCR = 15`. It must start PCR15 at zero
+and preserve the mandatory phase-close unit. The tested consumer suppresses
+systemd-pcrphase-initrd and predicts raw stub PCR11, without `enter-initrd`.
+
+Prepare expected SHA256 PCR values from trusted built artifacts and a reviewed
+EFI/firmware baseline. Then approve before boot:
+
+```sh
+sudo combined-unlock-manage approve --bundle /boot/root/bundle.json \
+  --authority /secure/approval.pem --expected-pcrs /secure/expected.json
+```
+
+The JSON maps exactly `"4"`, `"7"`, `"11"` to 64-character hex values. The tool
+computes the TPM PolicyPCR digest from these expected values and signs the
+profile/epoch-scoped approval. It verifies the authority and epoch, retains
+existing approvals (up to 16), and refuses current-state approval for v2.
+**The caller is responsible for deriving and reviewing expected values**; an
+arbitrary JSON file is not evidence of a trustworthy boot. No generic UKI
+builder/installer or production rebuild integration is included in this package.
+
+The boot provider chooses the approval matching the actual policy digest, then
+verifies its signature in the TPM. Epoch and phase checks remain outside
+PolicyAuthorize. Switching the bundle's public version/PCR selection cannot
+change the enrolled sealed object's policy. Deleting an approval is not durable
+revocation while an attacker can restore it within the same epoch.
+
+The VM-specific parent repository supplies a guarded UKI build/sign/predict/
+verify/install workflow and its own baseline review. The management signing key
+and EFI signing key stay outside the initrd/Nix store. No platform PK is needed
+to sign a TPM approval or perform ordinary UKI builds.
 
 ## Tests
 
@@ -150,5 +190,5 @@ python3 tests/test_provider.py
 
 The test creates a fresh private swtpm, never opens a hardware TPM, and checks
 repeat unsealing without global flushes, authenticated-envelope tampering,
-revoked/new epochs and phase closure. VM boot validation belongs to the consuming
+revoked/new epochs, future UKI prediction approval and both phase profiles. VM boot validation belongs to the consuming
 configuration; unit policy tests cannot establish a physical trust chain.

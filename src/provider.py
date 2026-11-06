@@ -29,7 +29,11 @@ def encode(value):
     return base64.b64encode(value).decode()
 
 
-def policy_ref(epoch):
+def policy_ref(epoch, profile='legacy'):
+    if profile == 'uki':
+        return b'tpm-fido2-unlock/uki-v2/epoch/' + epoch.to_bytes(8, 'big')
+    if profile != 'legacy':
+        raise ValueError('Unknown policy profile')
     return b'nixos-trial/unseal/v1/epoch/' + epoch.to_bytes(8, 'big')
 
 
@@ -46,27 +50,22 @@ def session(tpm, trial=False):
                                  None, TPM2_ALG.SHA256)
 
 
-def finish_policy(tpm, auth, signer_name, ticket, approved, epoch, index):
-    tpm.policy_authorize(auth, approved, signer_name, ticket, policy_ref(epoch))
+def finish_policy(tpm, auth, signer_name, ticket, approved, epoch, index, profile='legacy'):
+    tpm.policy_authorize(auth, approved, signer_name, ticket, policy_ref(epoch, profile))
     tpm.policy_nv(index, index, auth, epoch.to_bytes(8, 'big'), TPM2_EO.EQ)
     # This mandatory phase check follows PolicyAuthorize too.
-    tpm.policy_pcr(auth, PHASE_DIGEST, 'sha256:11')
+    tpm.policy_pcr(auth, PHASE_DIGEST, 'sha256:15' if profile == 'uki' else 'sha256:11')
     tpm.policy_command_code(auth, TPM2_CC.Unseal)
 
 
 def recover_parameters(bundle, tcti):
     """Return authenticated parameters; flush only handles allocated here."""
-    if bundle['version'] != 1:
+    version = bundle['version']
+    if version not in (1, 2):
         raise ValueError('Unsupported bundle version')
+    profile = 'uki' if version == 2 else 'legacy'
     epoch = bundle['epoch']
-    ref = policy_ref(epoch)
-    approved = decode(bundle['approved'])
-    signature = decode(bundle['signature'])
-    # TPMT_SIGNATURE: RSASSA + SHA256 + TPM2B_PUBLIC_KEY_RSA.
-    sig, consumed = TPMT_SIGNATURE.unmarshal(
-        b'\x00\x14\x00\x0b' + len(signature).to_bytes(2, 'big') + signature)
-    if consumed != len(signature) + 6:
-        raise ValueError('Invalid signature encoding')
+    ref = policy_ref(epoch, profile)
     public, _ = TPM2B_PUBLIC.unmarshal(decode(bundle['public']))
     private, _ = TPM2B_PRIVATE.unmarshal(decode(bundle['private']))
     with ESAPI(tcti) as tpm:
@@ -77,16 +76,27 @@ def recover_parameters(bundle, tcti):
             signer = tpm.load_external(TPM2B_PUBLIC.from_pem(bundle['authority'].encode()),
                                        hierarchy=ESYS_TR.OWNER)
             handles.append(signer)
-            ticket = tpm.verify_signature(signer, hashlib.sha256(approved + ref).digest(), sig)
             name = tpm.tr_get_name(signer)
+            auth = session(tpm)
+            handles.append(auth)
+            tpm.policy_pcr(auth, None, bundle.get('pcrs', PCRS))
+            current = bytes(tpm.policy_get_digest(auth))
+            approvals = bundle.get('approvals', []) if version == 2 else [bundle]
+            matching = [entry for entry in approvals if decode(entry['approved']) == current]
+            if not matching:
+                raise ValueError('Boot measurements are not approved')
+            approved = current
+            signature = decode(matching[0]['signature'])
+            sig, consumed = TPMT_SIGNATURE.unmarshal(
+                b'\x00\x14\x00\x0b' + len(signature).to_bytes(2, 'big') + signature)
+            if consumed != len(signature) + 6:
+                raise ValueError('Invalid signature encoding')
+            ticket = tpm.verify_signature(signer, hashlib.sha256(approved + ref).digest(), sig)
             tpm.flush_context(signer)
             handles.remove(signer)
             obj = tpm.load(parent, private, public)
             handles.append(obj)
-            auth = session(tpm)
-            handles.append(auth)
-            tpm.policy_pcr(auth, None, bundle.get('pcrs', PCRS))
-            finish_policy(tpm, auth, name, ticket, approved, epoch, index)
+            finish_policy(tpm, auth, name, ticket, approved, epoch, index, profile)
             wrapping_key = bytes(tpm.unseal(obj, session1=auth))
             plaintext = AESGCM(wrapping_key).decrypt(decode(bundle['nonce']),
                                                     decode(bundle['envelope']), AAD)

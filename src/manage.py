@@ -54,9 +54,11 @@ def parser():
     enroll.add_argument('--fido2-device', default='auto')
     enroll.add_argument('--rp', default='io.github.tpm-fido2-unlock')
     enroll.add_argument('--pcrs', default=provider.PCRS)
+    enroll.add_argument('--profile', choices=['legacy', 'uki'], default='legacy')
     approve = sub.add_parser('approve', help='Explicitly sign the current measured state in the bundle epoch')
     approve.add_argument('--bundle', type=Path, required=True)
     approve.add_argument('--authority', type=Path, required=True)
+    approve.add_argument('--expected-pcrs', type=Path, help='JSON map of expected SHA256 PCR values, from trusted artifacts')
     return result
 
 
@@ -97,9 +99,23 @@ def main():
             if authority.public_key().public_bytes(serialization.Encoding.PEM,
                     serialization.PublicFormat.SubjectPublicKeyInfo).decode() != bundle['authority']:
                 raise RuntimeError('Approval key does not match enrollment authority')
-            management.approve(tpm, bundle, authority)
+            expected = None
+            if args.expected_pcrs:
+                if bundle['version'] != 2 or bundle['pcrs'] != 'sha256:4,7,11':
+                    raise ValueError('Expected-PCR approval requires the UKI v2 profile')
+                values = json.loads(args.expected_pcrs.read_text())
+                if set(values) != {'4', '7', '11'}:
+                    raise ValueError('Expected exactly PCRs 4, 7 and 11')
+                raw = [bytes.fromhex(values[str(n)]) for n in (4, 7, 11)]
+                if any(len(value) != 32 for value in raw):
+                    raise ValueError('Expected SHA256 PCR values')
+                import hashlib
+                expected = hashlib.sha256(b''.join(raw)).digest()
+            elif bundle['version'] == 2:
+                raise ValueError('UKI profile requires artifact-derived expected PCRs')
+            management.approve(tpm, bundle, authority, expected)
         atomic_bundle(args.bundle, bundle)
-        print('Approved current measurements explicitly; epoch and LUKS slots unchanged.')
+        print('Approved measurements explicitly; epoch and LUKS slots unchanged.')
         return
     if not 0 <= args.slot <= 31 or not 0 <= args.recovery_slot <= 31 or args.slot == args.recovery_slot:
         raise ValueError('Choose a distinct free slot in 0–31')
@@ -133,7 +149,8 @@ def main():
         params = dict(template, credential=verified[0].decode(), salt=provider.encode(secrets.token_bytes(32)))
         key = provider.derive_key(params, token)
         # Seal before slot mutation; no plaintext wrapping-key artifact is retained.
-        bundle = management.seal(tpm, index, parent, params, authority, args.pcrs)
+        bundle = management.seal(tpm, index, parent, params, authority,
+                                 'sha256:4,7,11' if args.profile == 'uki' else args.pcrs, args.profile)
         del params
     with tempfile.TemporaryDirectory(prefix='combined-enroll-', dir='/run') as directory:
         recovery_file = Path(directory) / 'recovery'

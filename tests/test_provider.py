@@ -75,6 +75,57 @@ def main():
             else:
                 raise RuntimeError('Phase closure did not block unsealing')
             print('PASS: closing PCR11 prevents later unsealing.', flush=True)
+            # Predict a future UKI state, approve BEFORE extending, then boot it.
+            import hashlib
+            with ESAPI(tcti) as tpm:
+                index = tpm.tr_from_tpmpublic(management.INDEX)
+                parent = tpm.tr_from_tpmpublic(management.PARENT)
+                uki = management.seal(tpm, index, parent, params, authority,
+                                      'sha256:4,7,11', 'uki')
+                future4 = hashlib.sha256(bytes(32) + bytes([42]) * 32).digest()
+                current11 = hashlib.sha256(bytes(32) + provider.CLOSED).digest()
+                expected = hashlib.sha256(future4 + bytes(32) + current11).digest()
+                management.approve(tpm, uki, authority, expected)
+            try:
+                provider.recover_parameters(uki, tcti)
+            except ValueError:
+                pass
+            else:
+                raise RuntimeError('Unapproved UKI state accepted')
+            with ESAPI(tcti) as tpm:
+                tpm.pcr_extend(ESYS_TR.PCR4, TPML_DIGEST_VALUES(digests=[
+                    TPMT_HA(hashAlg=TPM2_ALG.SHA256, digest=TPMU_HA(sha256=bytes([42]) * 32))]))
+            assert provider.recover_parameters(uki, tcti) == params
+            print('PASS: pre-approved future UKI measurements unlock only after matching PCR extension.', flush=True)
+            with ESAPI(tcti) as tpm:
+                index = tpm.tr_from_tpmpublic(management.INDEX)
+                tpm.tr_set_auth(ESYS_TR.OWNER, owner)
+                tpm.nv_increment(index, auth_handle=ESYS_TR.OWNER)
+            try:
+                provider.recover_parameters(uki, tcti)
+            except TSS2_Exception as error:
+                if error.rc & 0xfff != 0x126:
+                    raise
+            else:
+                raise RuntimeError('Revoked UKI epoch accepted')
+            with ESAPI(tcti) as tpm:
+                index = tpm.tr_from_tpmpublic(management.INDEX)
+                parent = tpm.tr_from_tpmpublic(management.PARENT)
+                uki = management.seal(tpm, index, parent, params, authority, 'sha256:4,7,11', 'uki')
+                management.approve(tpm, uki, authority, expected)
+                tpm.pcr_extend(ESYS_TR.PCR15, TPML_DIGEST_VALUES(digests=[
+                    TPMT_HA(hashAlg=TPM2_ALG.SHA256, digest=TPMU_HA(sha256=provider.CLOSED))]))
+                # Even an authority signature for current PCR4/7/11 cannot
+                # override the mandatory zero-PCR15 guard outside Authorize.
+                management.approve(tpm, uki, authority)
+            try:
+                provider.recover_parameters(uki, tcti)
+            except TSS2_Exception as error:
+                if error.rc & 0xfff != 0x1c4:
+                    raise
+            else:
+                raise RuntimeError('UKI late-phase authorization bypassed')
+            print('PASS: UKI epoch revocation and mandatory PCR15 phase closure block unsealing.', flush=True)
         finally:
             proc.terminate()
             proc.wait(timeout=5)

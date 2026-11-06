@@ -38,19 +38,26 @@ def new_authority():
     return rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
-def approve(tpm, bundle, authority):
+def approve(tpm, bundle, authority, expected=None):
     auth = session(tpm, trial=True)
     try:
-        tpm.policy_pcr(auth, None, bundle.get('pcrs', PCRS))
+        tpm.policy_pcr(auth, expected, bundle.get('pcrs', PCRS))
         digest = bytes(tpm.policy_get_digest(auth))
     finally:
         tpm.flush_context(auth)
-    bundle['approved'] = encode(digest)
-    bundle['signature'] = encode(authority.sign(digest + policy_ref(bundle['epoch']),
-                                               padding.PKCS1v15(), hashes.SHA256()))
+    profile = 'uki' if bundle['version'] == 2 else 'legacy'
+    entry = dict(approved=encode(digest), signature=encode(authority.sign(
+        digest + policy_ref(bundle['epoch'], profile), padding.PKCS1v15(), hashes.SHA256())))
+    if profile == 'uki':
+        entries = [item for item in bundle.get('approvals', []) if item['approved'] != entry['approved']]
+        if len(entries) >= 16:
+            raise ValueError('Approval limit reached; explicitly retire an older approval')
+        bundle['approvals'] = entries + [entry]
+    else:
+        bundle.update(entry)
 
 
-def seal(tpm, index, parent, params, authority, pcrs=PCRS):
+def seal(tpm, index, parent, params, authority, pcrs=PCRS, profile='legacy'):
     epoch = int.from_bytes(bytes(tpm.nv_read(index, 8)), 'big')
     public_key = authority.public_key().public_bytes(
         serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
@@ -61,7 +68,7 @@ def seal(tpm, index, parent, params, authority, pcrs=PCRS):
         tpm.flush_context(signer)
     auth = session(tpm, trial=True)
     try:
-        finish_policy(tpm, auth, name, TPMT_TK_VERIFIED(tag=TPM2_ST.VERIFIED, hierarchy=TPM2_RH.NULL), b'', epoch, index)
+        finish_policy(tpm, auth, name, TPMT_TK_VERIFIED(tag=TPM2_ST.VERIFIED, hierarchy=TPM2_RH.NULL), b'', epoch, index, profile)
         digest = bytes(tpm.policy_get_digest(auth))
     finally:
         tpm.flush_context(auth)
@@ -73,9 +80,12 @@ def seal(tpm, index, parent, params, authority, pcrs=PCRS):
     nonce = secrets.token_bytes(12)
     envelope = AESGCM(wrapping_key).encrypt(nonce, json.dumps(params).encode(), AAD)
     del wrapping_key
-    bundle = dict(version=1, epoch=epoch, parent=int(tpm.tr_get_tpm_handle(parent)),
+    bundle = dict(version=2 if profile == 'uki' else 1, epoch=epoch, parent=int(tpm.tr_get_tpm_handle(parent)),
                   index=int(tpm.tr_get_tpm_handle(index)), pcrs=pcrs,
                   authority=public_key.decode(), public=encode(public.marshal()),
                   private=encode(private.marshal()), nonce=encode(nonce), envelope=encode(envelope))
-    approve(tpm, bundle, authority)
+    if profile == 'legacy':
+        approve(tpm, bundle, authority)
+    else:
+        bundle['approvals'] = []
     return bundle

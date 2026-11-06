@@ -51,10 +51,15 @@ in {
         };
       });
     };
+    phasePCR = lib.mkOption {
+      type = lib.types.enum [ 11 15 ];
+      default = 11;
+      description = "Mandatory phase guard: legacy zero PCR11, or dedicated zero PCR15 for UKI v2 bundles.";
+    };
     phaseAfter = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
-      description = "Additional initrd consumers that must finish before closing the zero-PCR11 phase.";
+      description = "Additional initrd consumers that must finish before closing the early-boot phase.";
     };
     keyTimeout = lib.mkOption {
       type = lib.types.ints.between 5 120;
@@ -131,7 +136,7 @@ in {
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
-          ExecStart = "${package}/bin/combined-unlock-close-phase";
+          ExecStart = "${package}/bin/combined-unlock-close-phase --pcr ${toString cfg.phasePCR}";
           TimeoutStartSec = 10;
         } // lib.optionalAttrs (mount != null) {
           ExecStartPost = "${pkgs.util-linux}/bin/umount ${lib.escapeShellArg mount.mountPoint}";

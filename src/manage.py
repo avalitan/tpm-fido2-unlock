@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import secrets
-import tempfile
 
 from cryptography.hazmat.primitives import serialization
 from tpm2_pytss import ESAPI, TPM2_CAP
@@ -13,6 +12,7 @@ from tpm2_pytss import ESAPI, TPM2_CAP
 import management
 import provider
 import identity
+import enrollment
 
 
 def atomic_bundle(path, bundle):
@@ -67,6 +67,9 @@ def parser():
     enroll.add_argument('--profile', choices=['legacy', 'uki'], default='legacy')
     enroll.add_argument('--next-epoch', action='store_true', help='Stage the immediately next UKI epoch without advancing NV')
     enroll.add_argument('--identity', type=Path, help='Require this previously enrolled public identity before creating the unlock credential')
+    enroll.add_argument('--additional-volume', nargs=4, action='append', default=[],
+        metavar=('DEVICE', 'SLOT', 'RECOVERY_SLOT', 'RECOVERY_KEY_FILE'),
+        help='Explicitly enroll the SAME derived key on another LUKS volume; repeatable, requires --identity')
     approve = sub.add_parser('approve', help='Explicitly sign the current measured state in the bundle epoch')
     approve.add_argument('--bundle', type=Path, required=True)
     approve.add_argument('--authority', type=Path, required=True)
@@ -159,14 +162,17 @@ def main():
         raise RuntimeError('Bundle already exists; refusing replacement')
     if not args.bundle.parent.is_dir() or str(args.bundle.resolve()).startswith('/nix/store/'):
         raise ValueError('Create a writable runtime bundle directory outside the Nix store')
-    before = json.loads(provider.run('cryptsetup', 'luksDump', '--dump-json-metadata', args.device))
-    if str(args.slot) in before['keyslots'] or str(args.recovery_slot) not in before['keyslots']:
-        raise RuntimeError('New slot is occupied or recovery slot is absent')
+    if args.additional_volume and not args.identity:
+        raise ValueError('Shared enrollment requires a pinned verification identity')
     recovery = args.recovery_key_file.read_bytes() if args.recovery_key_file else getpass.getpass('Recovery passphrase: ').encode()
     if not recovery:
         raise ValueError('Empty recovery key')
-    provider.run('cryptsetup', 'open', '--test-passphrase', '--key-slot', str(args.recovery_slot),
-                 '--key-file', '-', args.device, data=recovery)
+    targets = [dict(device=args.device, slot=args.slot, recovery_slot=args.recovery_slot, recovery=recovery)]
+    for device, slot, recovery_slot, recovery_file in args.additional_volume:
+        targets.append(dict(device=device, slot=int(slot), recovery_slot=int(recovery_slot),
+                            recovery=Path(recovery_file).read_bytes()))
+    targets = enrollment.preflight(targets, provider.run)
+    del recovery
     # Validate TPM handles/authority before modifying LUKS. No owner secret is needed to seal.
     with ESAPI(args.tcti) as tpm:
         index = tpm.tr_from_tpmpublic(args.index)
@@ -199,21 +205,10 @@ def main():
                                  'sha256:4,7,11' if args.profile == 'uki' else args.pcrs, args.profile,
                                  current_epoch + 1 if args.next_epoch else None)
         del params
-    with tempfile.TemporaryDirectory(prefix='combined-enroll-', dir='/run') as directory:
-        recovery_file = Path(directory) / 'recovery'
-        recovery_file.write_bytes(recovery)
-        provider.run('cryptsetup', 'luksAddKey', '--key-slot', str(args.slot), '--pbkdf', 'pbkdf2',
-                     '--pbkdf-force-iterations', '100000', '--key-file', str(recovery_file),
-                     args.device, '-', data=key)
-    del recovery
-    provider.run('cryptsetup', 'open', '--test-passphrase', '--key-slot', str(args.slot),
-                 '--key-file', '-', args.device, data=key)
-    del key
+    enrollment.install(targets, key, provider.run)
+    del key, targets
     atomic_bundle(args.bundle, bundle)
-    after = json.loads(provider.run('cryptsetup', 'luksDump', '--dump-json-metadata', args.device))
-    if after['tokens'] != before['tokens'] or any(after['keyslots'].get(k) != v for k, v in before['keyslots'].items()):
-        raise RuntimeError('Unexpected change to prior slots/token metadata')
-    print('Combined slot enrolled and verified; all prior slots preserved. No public FIDO2 token added.')
+    print('Combined slot enrolled and verified on each selected volume; prior slots preserved. No public FIDO2 token added.')
     print('Boot-test and verify recovery before separately retiring old standalone unlock paths.')
 
 

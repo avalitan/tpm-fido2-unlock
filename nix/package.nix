@@ -5,6 +5,7 @@ let
     mkdir -p $out/lib
     cp ${../src/provider.py} $out/lib/provider.py
     cp ${../src/identity.py} $out/lib/identity.py
+    cp ${../src/key_sockets.py} $out/lib/key_sockets.py
   '';
   provider = pkgs.writeShellApplication {
     name = "combined-unlock";

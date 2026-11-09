@@ -215,6 +215,69 @@ through the existing migration/epoch workflow; this option alone does not
 revoke them. No VM/physical root migration happens automatically. An independent
 TPM contribution to the final disk key remains a separate, unimplemented design.
 
+## Optional shared unlock key for several disks
+
+The default is a separate enrollment/key for each volume. To opt into a shared
+key, enroll ONE credential and its derived unlock key on all selected volumes,
+then configure ONE provider with `shareWith`:
+
+```nix
+boot.initrd.luks.devices.diskA.device = "/dev/disk/by-uuid/REPLACE-FIRST-UUID";
+boot.initrd.luks.devices.diskB.device = "/dev/disk/by-uuid/REPLACE-SECOND-UUID";
+boot.initrd.combinedUnlock.providers.diskA = {
+  bundle = "/run/combined-unlock-esp/group/primary.json";
+  identityPolicy = ./identities.json;
+  shareWith = [ "diskB" ];
+};
+```
+
+Do not define another provider for `diskB`: its cryptsetup unit receives the key
+from the `diskA` provider through its own root-only socket. Overlapping groups,
+duplicates, invalid names and groups above 16 volumes are rejected. The phase
+closer waits for all member cryptsetup units AND the provider process to finish.
+Independent providers serialize token access, including when sharing is disabled.
+
+For enrollment, add `--additional-volume DEVICE SLOT RECOVERY_SLOT RECOVERY_KEY_FILE`
+to `enroll --identity ...`, repeated for each extra volume. Example using explicit
+placeholder devices and protected recovery files outside the Nix store:
+
+```sh
+sudo combined-unlock-manage enroll --profile uki \
+  --device /dev/disk/by-uuid/REPLACE-FIRST-UUID --slot 2 --recovery-slot 0 \
+  --recovery-key-file /run/first-recovery \
+  --additional-volume /dev/disk/by-uuid/REPLACE-SECOND-UUID 2 0 /run/second-recovery \
+  --identity primary-public.json --authority /secure/approval.pem \
+  --bundle /boot/group/primary.json
+```
+
+Every new slot must be free. Each volume's recovery key may differ. All targets,
+UUID uniqueness, recovery keys and free slots are checked before credential
+creation or slot writes. Metadata is rechecked after token interaction, then
+the same derived key is added and verified on each volume. Existing slots and
+public-token metadata are preserved. Enroll the backup token separately into
+another free slot on each volume and a separate shared bundle; the public
+allowlist selects primary OR backup for the whole group.
+
+At boot the first member request triggers one identity proof/unseal/unlock
+derivation. The provider keeps the derived key only in its process memory and
+sends it once through each member's distinct socket, then exits. A retry on one
+socket cannot consume a different member's delivery. No key cache file or
+cross-run reuse is introduced: another invocation requires a new proof/touch.
+A missing member expires at `keyTimeout`; missing-disk/degraded-root boot still
+requires separate policy/integration. With silent identity proof this gives
+one unlock touch per group; `--proof-touch` adds the identity touch.
+
+Each volume keeps its independent LUKS master key and recovery slot. Sharing the
+unlock secret links access to the volumes in that group. Multi-volume enrollment
+is not atomic across disks: a write failure can leave a new slot on earlier
+targets without a published bundle. It stops without deleting slots; inspect
+and resolve explicitly using retained recovery. Existing enrollments are not
+converted merely by setting `shareWith`.
+
+The two-volume path has disposable CanoKey/LUKS/software-TPM tests and generated
+NixOS unit checks. Two-disk UKI boot, RAID1/missing-member behavior and physical
+Solo/YubiKey validation remain pending; it is not enabled on the installed VM root.
+
 ## UKI profile (version 2)
 
 Enroll a distinct free slot with `enroll --profile uki`; the prior slots are
@@ -288,6 +351,7 @@ nix flake check
 python3 tests/test_provider.py
 python3 tests/test_epoch_transition.py
 python3 tests/test_identity.py
+python3 tests/test_shared_keys.py
 ```
 
 The test creates a fresh private swtpm, never opens a hardware TPM, and checks
@@ -301,3 +365,8 @@ proofs and no unlock requests on failed verification. The optional
 temporary LUKS image/private swtpm plus two credential pairs on its CanoKey;
 it does not access the installed root or system TPM. One emulator with two
 credentials is not validation of two physical devices or vendor attestation.
+`test_shared_keys.py` checks Unix-socket fanout, activation FDs, single-use
+per-volume delivery, bounded lifetimes/locking and enrollment preflight/failure
+handling without real devices. Optional `tests/smoke_shared_vm.py` tests two
+disposable encrypted images with independent recovery keys, primary/backup
+shared enrollment and one proof/derivation supplying both disk sockets.

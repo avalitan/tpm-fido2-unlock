@@ -4,9 +4,12 @@ let
   package = import ./package.nix { inherit pkgs; };
   names = builtins.attrNames cfg.providers;
   configured = lib.filterAttrs (_: value: value.configureLuks) cfg.providers;
+  members = name: [ name ] ++ cfg.providers.${name}.shareWith;
+  managedNames = lib.concatMap members (builtins.attrNames configured);
+  ownerOf = volume: builtins.head (lib.filter (name: builtins.elem volume (members name)) names);
   keyPath = name: "/run/combined-unlock/${name}.sock";
   unitName = name: "combined-unlock-${name}";
-  cryptUnits = map (name: "systemd-cryptsetup@${utils.escapeSystemdPath name}.service") (builtins.attrNames configured);
+  cryptUnits = map (name: "systemd-cryptsetup@${utils.escapeSystemdPath name}.service") managedNames;
   mount = cfg.bundleMount;
   phase = "combined-unlock-close-phase";
   identityPolicies = lib.mapAttrs (name: value:
@@ -45,6 +48,11 @@ in {
             default = null;
             description = "PUBLIC identity allowlist copied into the Nix store/signed initrd. Entries map primary/backup verification keys to runtime bundles. Never include unlock salts or secret credential IDs.";
           };
+          shareWith = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            description = "Other declared initrd LUKS volume names enrolled with the SAME derived unlock key. One proof/touch supplies separate root-only sockets for this group; empty keeps per-volume keys. Each member retains its own LUKS master key and recovery slot.";
+          };
         };
       });
     };
@@ -81,11 +89,22 @@ in {
       { assertion = names != [ ]; message = "combinedUnlock requires at least one provider."; }
       { assertion = lib.all (name: builtins.match "[A-Za-z0-9_-]+" name != null) names;
         message = "combinedUnlock provider names may contain only letters, digits, underscores and hyphens."; }
-    ] ++ lib.mapAttrsToList (name: _: {
+      { assertion = builtins.length managedNames == builtins.length (lib.unique managedNames);
+        message = "A LUKS volume must belong to exactly one combinedUnlock provider/group."; }
+      { assertion = lib.all (name: lib.all (member:
+          builtins.match "[A-Za-z0-9_-]+" member != null
+          && !(builtins.elem member names)
+          && builtins.hasAttr member config.boot.initrd.luks.devices
+        ) cfg.providers.${name}.shareWith
+          && builtins.length (members name) <= 16
+          && (cfg.providers.${name}.shareWith == [ ] ||
+            (cfg.providers.${name}.configureLuks && cfg.providers.${name}.identityPolicy != null))) names;
+        message = "shareWith needs up to 15 distinct declared LUKS members without their own provider, configureLuks enabled, and a pinned identityPolicy."; }
+    ] ++ map (name: {
       assertion = lib.all (option: !(lib.hasPrefix "fido2-" option || lib.hasPrefix "tpm2-" option || lib.hasPrefix "pkcs11-" option))
         config.boot.initrd.luks.devices.${name}.crypttabExtraOpts;
       message = "Remove standalone token crypttab options from combinedUnlock device ${name}.";
-    }) configured;
+    }) managedNames;
     boot.initrd.systemd.enable = true;
     boot.initrd.availableKernelModules = [ "tpm_crb" "tpm_tis" "usbhid" "hid_generic" ]
       ++ lib.optionals (mount != null && mount.fsType == "vfat") [ "vfat" "nls_cp437" "nls_iso8859_1" ];
@@ -101,15 +120,17 @@ in {
       options = mount.options;
       unitConfig.DefaultDependencies = false;
     };
-    boot.initrd.luks.devices = lib.mapAttrs (name: value: {
+    boot.initrd.luks.devices = lib.genAttrs managedNames (name: {
       keyFile = keyPath name;
       keyFileTimeout = cfg.keyTimeout;
-    } // lib.optionalAttrs (value.device != null) { inherit (value) device; }) configured;
+    } // lib.optionalAttrs (builtins.hasAttr name configured && configured.${name}.device != null) {
+      device = configured.${name}.device;
+    });
     boot.initrd.systemd.sockets = lib.mapAttrs' (name: _: lib.nameValuePair (unitName name) {
       description = "Combined TPM and FIDO2 key socket for ${name}";
       unitConfig.DefaultDependencies = false;
       socketConfig = {
-        ListenStream = keyPath name;
+        ListenStream = map keyPath (members name);
         SocketMode = "0600";
         DirectoryMode = "0700";
         RemoveOnStop = true;
@@ -125,7 +146,9 @@ in {
         serviceConfig = {
           Type = "oneshot";
           ExecStart = lib.escapeShellArgs [ "${package}/bin/combined-unlock" value.bundle
-            "--socket-activated" "--device" value.fido2Device ]
+            "--socket-activated" "--device" value.fido2Device
+            "--client-timeout" (toString cfg.keyTimeout) ]
+            + " " + lib.escapeShellArgs (lib.concatMap (member: [ "--socket-path" (keyPath member) ]) (members name))
             + lib.optionalString (value.identityPolicy != null)
               (" --identity-policy " + lib.escapeShellArg (toString identityPolicies.${name}));
           TimeoutStartSec = cfg.keyTimeout + 10;
@@ -133,17 +156,19 @@ in {
           LimitCORE = 0;
         };
       }) cfg.providers)
-      (lib.mapAttrs' (name: _: lib.nameValuePair "systemd-cryptsetup@${utils.escapeSystemdPath name}" {
+      (lib.listToAttrs (map (name: lib.nameValuePair "systemd-cryptsetup@${utils.escapeSystemdPath name}" {
         # Generated by systemd-cryptsetup-generator: never replace the service.
         overrideStrategy = "asDropin";
-        wants = [ "${unitName name}.socket" ];
-        after = [ "${unitName name}.socket" ];
-      }) configured)
+        wants = [ "${unitName (ownerOf name)}.socket" ];
+        after = [ "${unitName (ownerOf name)}.socket" ];
+      }) managedNames))
       { ${phase} = {
         description = "Close experimental TPM unsealing before switch-root";
         requiredBy = [ "initrd-cleanup.service" "initrd-switch-root.service" ];
         before = [ "initrd-cleanup.service" "initrd-switch-root.service" "initrd-switch-root.target" ];
-        after = cryptUnits ++ cfg.phaseAfter;
+        # A shared provider may still hold its key while waiting for a member.
+        # Finish/expire that process before closing the TPM phase or switch-root.
+        after = cryptUnits ++ map (name: "${unitName name}.service") names ++ cfg.phaseAfter;
         unitConfig.DefaultDependencies = false;
         serviceConfig = {
           Type = "oneshot";

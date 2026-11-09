@@ -27,6 +27,7 @@
         python3 ${source}/tests/test_provider.py
         python3 ${source}/tests/test_epoch_transition.py
         python3 ${source}/tests/test_identity.py
+        python3 ${source}/tests/test_shared_keys.py
         touch $out
       '';
     });

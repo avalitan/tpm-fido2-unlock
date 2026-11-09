@@ -1,12 +1,12 @@
 """Experimental TPM+FIDO2 key provider. No enrollment or signing capabilities."""
 import argparse
 import base64
+from contextlib import ExitStack
 import hashlib
 import json
 import os
 from pathlib import Path
 import secrets
-import socket
 import subprocess
 import sys
 import time
@@ -188,6 +188,8 @@ def main():
     parser.add_argument('--socket-activated', action='store_true', required=True)
     parser.add_argument('--device', default='auto', help='FIDO2 device path or auto for exactly one device')
     parser.add_argument('--identity-policy', help='Public allowlist embedded in the trusted initrd; never an untrusted ESP file')
+    parser.add_argument('--socket-path', action='append', help='Expected per-volume socket path (repeat for a shared key)')
+    parser.add_argument('--client-timeout', type=int, default=40)
     args = parser.parse_args()
     os.umask(0o077)
     if os.geteuid() != 0:
@@ -195,37 +197,38 @@ def main():
     try:
         # Only the kernel resource manager, never an environment-selected TPM.
         bundle = None if args.identity_policy else read_bundle(args.bundle)
-        if args.socket_activated:
-            if os.environ.get('LISTEN_PID') != str(os.getpid()) or os.environ.get('LISTEN_FDS') != '1':
-                raise RuntimeError('Expected one systemd socket')
-            with socket.socket(fileno=3) as listener:
-                listener.settimeout(25)
-                connection, _ = listener.accept()
-                with connection:
-                    connection.settimeout(5)
-                    if args.identity_policy:
-                        import identity
-                        policy = identity.read_json(args.identity_policy)
-                        identity.validate_policy(policy)
-                        state = {}
+        import key_sockets
+        state = {}
 
-                        def recover(entry):
-                            selected = select_epoch_bundle(read_bundle(entry['bundle']), 'device:/dev/tpmrm0')
-                            params = recover_parameters(selected, 'device:/dev/tpmrm0')
-                            state['selected'] = selected
-                            return params
+        def produce():
+            # One credential derivation for this explicit group; serialize all
+            # initrd groups using the same USB token. Release before distribution.
+            with key_sockets.token_lock(timeout=args.client_timeout):
+                if args.identity_policy:
+                    import identity
+                    policy = identity.read_json(args.identity_policy)
+                    identity.validate_policy(policy)
 
-                        with identity.Token(select_token(args.device)) as token:
-                            key = identity.unlock_with_policy(policy, token, recover)
-                        selected = state['selected']
-                    else:
-                        selected = select_epoch_bundle(bundle, 'device:/dev/tpmrm0')
+                    def recover(entry):
+                        selected = select_epoch_bundle(read_bundle(entry['bundle']), 'device:/dev/tpmrm0')
                         params = recover_parameters(selected, 'device:/dev/tpmrm0')
-                        key = derive_key(params, select_token(args.device))
-                        del params
-                    connection.sendall(key)
-                    del key
-        print(f"combined-unlock: success epoch={selected['epoch']}", file=sys.stderr)
+                        state['selected'] = selected
+                        return params
+
+                    with identity.Token(select_token(args.device)) as token:
+                        key = identity.unlock_with_policy(policy, token, recover)
+                else:
+                    selected = select_epoch_bundle(bundle, 'device:/dev/tpmrm0')
+                    params = recover_parameters(selected, 'device:/dev/tpmrm0')
+                    key = derive_key(params, select_token(args.device))
+                    del params
+                    state['selected'] = selected
+                return key
+
+        with ExitStack() as stack:
+            listeners = key_sockets.activated(stack, args.socket_path)
+            key_sockets.serve(listeners, produce, args.client_timeout)
+        print(f"combined-unlock: success epoch={state['selected']['epoch']}", file=sys.stderr)
     except Exception:
         # No tracebacks or subprocess output with credential material in journals.
         print('combined-unlock: unavailable; recovery required', file=sys.stderr)

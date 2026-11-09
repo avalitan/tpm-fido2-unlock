@@ -57,8 +57,12 @@ def approve(tpm, bundle, authority, expected=None):
         bundle.update(entry)
 
 
-def seal(tpm, index, parent, params, authority, pcrs=PCRS, profile='legacy'):
-    epoch = int.from_bytes(bytes(tpm.nv_read(index, 8)), 'big')
+def seal(tpm, index, parent, params, authority, pcrs=PCRS, profile='legacy', epoch=None):
+    current = int.from_bytes(bytes(tpm.nv_read(index, 8)), 'big')
+    if epoch is None:
+        epoch = current
+    if epoch != current and (profile != 'uki' or epoch != current + 1 or epoch >= 2**64):
+        raise ValueError('Only the current or immediately next UKI epoch can be sealed')
     public_key = authority.public_key().public_bytes(
         serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
     signer = tpm.load_external(TPM2B_PUBLIC.from_pem(public_key), hierarchy=ESYS_TR.OWNER)
@@ -89,3 +93,35 @@ def seal(tpm, index, parent, params, authority, pcrs=PCRS, profile='legacy'):
     else:
         bundle['approvals'] = []
     return bundle
+
+
+def epoch_set(current, following):
+    """Create a public two-epoch routing set; never changes the TPM."""
+    if (current.get('version') != 2 or following.get('version') != 2
+        or following.get('epoch') != current.get('epoch', -2) + 1
+        or any(current.get(key) != following.get(key) for key in ('index', 'parent', 'authority', 'pcrs'))
+        or current.get('pcrs') != 'sha256:4,7,11'
+        or not current.get('approvals') or not following.get('approvals')):
+        raise ValueError('Expected approved consecutive UKI epochs with common TPM/authority')
+    return dict(version=3, index=current['index'], bundles={
+        str(current['epoch']): current, str(following['epoch']): following})
+
+
+def advance_epoch(tpm, index, previous, target, owner):
+    """Low-level commit AFTER caller durably stages and boot-verifies artifacts.
+
+    Idempotent after a crash following NV increment. Never advances twice.
+    Caller must serialize operations and verify its transaction readiness.
+    """
+    if len(owner) != 32 or target != previous + 1 or not 0 <= previous < target < 2**64:
+        raise ValueError('Expected protected owner auth and one adjacent epoch step')
+    current = int.from_bytes(bytes(tpm.nv_read(index, 8)), 'big')
+    if current == target:
+        return False
+    if current != previous:
+        raise ValueError('Counter is outside the prepared transaction')
+    tpm.tr_set_auth(ESYS_TR.OWNER, owner)
+    tpm.nv_increment(index, auth_handle=ESYS_TR.OWNER)
+    if int.from_bytes(bytes(tpm.nv_read(index, 8)), 'big') != target:
+        raise RuntimeError('Counter advanced unexpectedly; recovery review required')
+    return True

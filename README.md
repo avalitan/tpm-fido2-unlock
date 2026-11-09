@@ -27,9 +27,10 @@ Version 2 adds a distinct UKI policy reference, PCR4/7/11 approvals calculated
 before boot, multiple approvals per epoch, and a mandatory zero-PCR15 early-phase
 guard after PolicyAuthorize/NV. The originating VM has boot-tested two signed
 systemd-stub UKIs, exact predicted PCRs, first-boot automatic unlock, rejection of
-a changed UKI, and late-unseal denial. Firmware Secure Boot enforcement is still
-disabled there; signing and install-time signature verification do not establish
-firmware enforcement. Hibernation and physical provisioning remain unvalidated.
+a changed UKI, and late-unseal denial. The consuming VM subsequently verified custom-key
+firmware Secure Boot, rejection of a changed UKI before Linux ran, and signed
+passphrase recovery. This is a VM integration result, not automatic physical
+provisioning by this package. Hibernation and physical provisioning remain unvalidated.
 
 ## Package and module
 
@@ -139,10 +140,11 @@ retired slots; handle them as part of migration. Enrollment interrupted after
 slot addition can leave a new slot without a final bundle: preserve recovery,
 inspect the state and clean up explicitly, rather than overwrite/re-enroll.
 
-The generic tool does not advance epochs, rotate/reseal enrollments, delete TPM
-objects, or retire old slots. Transactional epoch activation, production offline approval
-workflows and hardware-backed NV lifecycle policies still need implementation
-and validation. Epoch advancement revokes automatic unsealing, not EFI execution.
+The generic CLI does not commit epochs, delete TPM objects, or retire old slots.
+It can prepare the next UKI epoch with the explicit flags described below. A
+low-level management API and the consuming VM driver have tested a staged
+transition; production/offline workflows and hardware-backed NV lifecycle
+policies still need integration and validation. Epoch advancement revokes automatic unsealing, not EFI execution.
 Python/subprocess memory is not guaranteed zeroized.
 
 ## UKI profile (version 2)
@@ -180,12 +182,43 @@ verify/install workflow and its own baseline review. The management signing key
 and EFI signing key stay outside the initrd/Nix store. No platform PK is needed
 to sign a TPM approval or perform ordinary UKI builds.
 
+## Staged epoch transition
+
+For UKI enrollment, `enroll --profile uki --next-epoch` creates a new FIDO2
+credential/LUKS slot and seals for exactly counter+1, without changing the counter
+or prior slots. `approve --next-epoch --expected-pcrs ...` approves that immediately
+next epoch; old/revoked epochs cannot be repaired by either approval mode.
+
+`management.epoch_set(current, following)` validates two approved adjacent v2
+bundles with matching authority/TPM handles and returns a public version-3 routing
+container. The provider reads the real counter to choose one child, then enforces
+that child's original epoch/phase TPM policy. The container does not replace the
+cryptographic policy. Restoring an old-only container cannot roll back the TPM.
+A selected public child cannot claim a different epoch or NV index.
+
+`management.advance_epoch(tpm, index, previous, target, owner)` is a LOW-LEVEL
+operation for callers that have already persisted and boot-verified their staged
+artifacts. It validates one adjacent increment and requires the protected owner
+secret. A retry after the counter reached target is a read-only no-op; it never
+increments twice. This API alone is not a transactional installer. Callers must
+serialize operations, validate recovery, signed boot artifacts, live approvals,
+sealed-object policy/metadata, and their durable transaction journal BEFORE the
+irreversible increment.
+
+The parent NixOS VM driver has tested staging both epochs, automatic current-
+epoch boot, commit, repeated commit, automatic next-epoch boot, old bundle and
+old signed-boot rejection, and separate retirement of old slots with recovery
+retained. An epoch revokes automatic secret release, not execution of EFI code
+that still has a valid firmware signature. TPM clearing/owner/physical-presence
+policies and physical token behavior still need hardware validation.
+
 ## Tests
 
 ```sh
 nix flake check
 # Or Python with cryptography + tpm2-pytss and swtpm on PATH:
 python3 tests/test_provider.py
+python3 tests/test_epoch_transition.py
 ```
 
 The test creates a fresh private swtpm, never opens a hardware TPM, and checks

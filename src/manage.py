@@ -55,10 +55,12 @@ def parser():
     enroll.add_argument('--rp', default='io.github.tpm-fido2-unlock')
     enroll.add_argument('--pcrs', default=provider.PCRS)
     enroll.add_argument('--profile', choices=['legacy', 'uki'], default='legacy')
+    enroll.add_argument('--next-epoch', action='store_true', help='Stage the immediately next UKI epoch without advancing NV')
     approve = sub.add_parser('approve', help='Explicitly sign the current measured state in the bundle epoch')
     approve.add_argument('--bundle', type=Path, required=True)
     approve.add_argument('--authority', type=Path, required=True)
     approve.add_argument('--expected-pcrs', type=Path, help='JSON map of expected SHA256 PCR values, from trusted artifacts')
+    approve.add_argument('--next-epoch', action='store_true', help='Approve the immediately next staged UKI epoch')
     return result
 
 
@@ -94,7 +96,8 @@ def main():
         with ESAPI(args.tcti) as tpm:
             index = tpm.tr_from_tpmpublic(bundle['index'])
             epoch = int.from_bytes(bytes(tpm.nv_read(index, 8)), 'big')
-            if epoch != bundle['epoch']:
+            allowed = epoch + 1 if args.next_epoch else epoch
+            if allowed != bundle['epoch'] or (args.next_epoch and bundle['version'] != 2):
                 raise RuntimeError('Bundle epoch is revoked; approval cannot repair it')
             if authority.public_key().public_bytes(serialization.Encoding.PEM,
                     serialization.PublicFormat.SubjectPublicKeyInfo).decode() != bundle['authority']:
@@ -117,6 +120,8 @@ def main():
         atomic_bundle(args.bundle, bundle)
         print('Approved measurements explicitly; epoch and LUKS slots unchanged.')
         return
+    if args.next_epoch and args.profile != 'uki':
+        raise ValueError('Future enrollment requires the UKI profile')
     if not 0 <= args.slot <= 31 or not 0 <= args.recovery_slot <= 31 or args.slot == args.recovery_slot:
         raise ValueError('Choose a distinct free slot in 0–31')
     if not args.device.startswith('/dev/'):
@@ -137,7 +142,7 @@ def main():
     with ESAPI(args.tcti) as tpm:
         index = tpm.tr_from_tpmpublic(args.index)
         parent = tpm.tr_from_tpmpublic(args.parent)
-        tpm.nv_read(index, 8)
+        current_epoch = int.from_bytes(bytes(tpm.nv_read(index, 8)), 'big')
         token = provider.select_token(args.fido2_device)
         template = dict(version=1, presence=True, pin=False, uv=False, rp=args.rp,
                         credential=provider.encode(b'test'), salt=provider.encode(bytes(32)))
@@ -150,7 +155,8 @@ def main():
         key = provider.derive_key(params, token)
         # Seal before slot mutation; no plaintext wrapping-key artifact is retained.
         bundle = management.seal(tpm, index, parent, params, authority,
-                                 'sha256:4,7,11' if args.profile == 'uki' else args.pcrs, args.profile)
+                                 'sha256:4,7,11' if args.profile == 'uki' else args.pcrs, args.profile,
+                                 current_epoch + 1 if args.next_epoch else None)
         del params
     with tempfile.TemporaryDirectory(prefix='combined-enroll-', dir='/run') as directory:
         recovery_file = Path(directory) / 'recovery'

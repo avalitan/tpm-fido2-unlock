@@ -25,6 +25,7 @@
       } ''
         export PYTHONDONTWRITEBYTECODE=1
         python3 ${source}/tests/test_provider.py
+        python3 ${source}/tests/test_epoch_transition.py
         touch $out
       '';
     });

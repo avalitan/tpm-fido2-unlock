@@ -58,8 +58,26 @@ def finish_policy(tpm, auth, signer_name, ticket, approved, epoch, index, profil
     tpm.policy_command_code(auth, TPM2_CC.Unseal)
 
 
+def select_epoch_bundle(bundle, tcti):
+    """Public routing only; the selected object's TPM policy enforces its epoch."""
+    if bundle.get('version') != 3:
+        return bundle
+    entries = bundle.get('bundles', {})
+    if not isinstance(entries, dict) or not 1 <= len(entries) <= 2:
+        raise ValueError('Unsupported epoch set')
+    with ESAPI(tcti) as tpm:
+        index = tpm.tr_from_tpmpublic(bundle['index'])
+        epoch = int.from_bytes(bytes(tpm.nv_read(index, 8)), 'big')
+    selected = entries.get(str(epoch))
+    if (not isinstance(selected, dict) or selected.get('version') != 2
+        or selected.get('epoch') != epoch or selected.get('index') != bundle['index']):
+        raise ValueError('No valid bundle for the current TPM epoch')
+    return selected
+
+
 def recover_parameters(bundle, tcti):
     """Return authenticated parameters; flush only handles allocated here."""
+    bundle = select_epoch_bundle(bundle, tcti)
     version = bundle['version']
     if version not in (1, 2):
         raise ValueError('Unsupported bundle version')
@@ -175,11 +193,12 @@ def main():
                 connection, _ = listener.accept()
                 with connection:
                     connection.settimeout(5)
-                    params = recover_parameters(bundle, 'device:/dev/tpmrm0')
+                    selected = select_epoch_bundle(bundle, 'device:/dev/tpmrm0')
+                    params = recover_parameters(selected, 'device:/dev/tpmrm0')
                     key = derive_key(params, select_token(args.device))
                     connection.sendall(key)
                     del key, params
-        print('combined-unlock: success', file=sys.stderr)
+        print(f"combined-unlock: success epoch={selected['epoch']}", file=sys.stderr)
     except Exception:
         # No tracebacks or subprocess output with credential material in journals.
         print('combined-unlock: unavailable; recovery required', file=sys.stderr)

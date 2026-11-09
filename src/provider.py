@@ -129,17 +129,26 @@ def recover_parameters(bundle, tcti):
 
 
 def validate_parameters(params):
-    if (params.get('version'), params.get('presence'), params.get('pin'), params.get('uv')) != (1, True, False, False):
+    if (params.get('version') not in (1, 2)
+        or (params.get('presence'), params.get('pin'), params.get('uv')) != (True, False, False)):
         raise ValueError('Unsupported interaction settings')
     rp = params.get('rp')
     if not isinstance(rp, str) or not 1 <= len(rp) <= 253 or any(c in rp for c in '\n\r\0'):
         raise ValueError('Invalid relying party')
     if len(decode(params['salt'])) != 32 or not 1 <= len(decode(params['credential'])) <= 1024:
         raise ValueError('Invalid credential parameters')
+    if params['version'] == 2:
+        import identity
+        digest = params.get('identity')
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+            raise ValueError('Invalid verification identity binding')
+        identity.public_key(params['public_key'])
 
 
 def derive_key(params, device):
     validate_parameters(params)
+    if params['version'] != 1:
+        raise ValueError('Guarded parameters require the verified open connection')
     request = '\n'.join([encode(secrets.token_bytes(32)), params['rp'],
                          params['credential'], params['salt'], '']).encode()
     output = run('fido2-assert', '-G', '-h', '-p', '-t', 'pin=false',
@@ -178,13 +187,14 @@ def main():
     parser.add_argument('bundle')
     parser.add_argument('--socket-activated', action='store_true', required=True)
     parser.add_argument('--device', default='auto', help='FIDO2 device path or auto for exactly one device')
+    parser.add_argument('--identity-policy', help='Public allowlist embedded in the trusted initrd; never an untrusted ESP file')
     args = parser.parse_args()
     os.umask(0o077)
     if os.geteuid() != 0:
         raise SystemExit('Requires root')
     try:
         # Only the kernel resource manager, never an environment-selected TPM.
-        bundle = read_bundle(args.bundle)
+        bundle = None if args.identity_policy else read_bundle(args.bundle)
         if args.socket_activated:
             if os.environ.get('LISTEN_PID') != str(os.getpid()) or os.environ.get('LISTEN_FDS') != '1':
                 raise RuntimeError('Expected one systemd socket')
@@ -193,11 +203,28 @@ def main():
                 connection, _ = listener.accept()
                 with connection:
                     connection.settimeout(5)
-                    selected = select_epoch_bundle(bundle, 'device:/dev/tpmrm0')
-                    params = recover_parameters(selected, 'device:/dev/tpmrm0')
-                    key = derive_key(params, select_token(args.device))
+                    if args.identity_policy:
+                        import identity
+                        policy = identity.read_json(args.identity_policy)
+                        identity.validate_policy(policy)
+                        state = {}
+
+                        def recover(entry):
+                            selected = select_epoch_bundle(read_bundle(entry['bundle']), 'device:/dev/tpmrm0')
+                            params = recover_parameters(selected, 'device:/dev/tpmrm0')
+                            state['selected'] = selected
+                            return params
+
+                        with identity.Token(select_token(args.device)) as token:
+                            key = identity.unlock_with_policy(policy, token, recover)
+                        selected = state['selected']
+                    else:
+                        selected = select_epoch_bundle(bundle, 'device:/dev/tpmrm0')
+                        params = recover_parameters(selected, 'device:/dev/tpmrm0')
+                        key = derive_key(params, select_token(args.device))
+                        del params
                     connection.sendall(key)
-                    del key, params
+                    del key
         print(f"combined-unlock: success epoch={selected['epoch']}", file=sys.stderr)
     except Exception:
         # No tracebacks or subprocess output with credential material in journals.

@@ -147,6 +147,74 @@ transition; production/offline workflows and hardware-backed NV lifecycle
 policies still need integration and validation. Epoch advancement revokes automatic unsealing, not EFI execution.
 Python/subprocess memory is not guaranteed zeroized.
 
+## Optional pinned-key verification (primary and backup)
+
+The new opt-in path requires a fresh ES256 signature from an enrolled PUBLIC
+bootstrap credential before it unseals the secret unlock credential ID/salt.
+Solo and compatible YubiKey FIDO2 devices use the same protocol. It verifies
+the subsequent unlock assertion too, using its public key inside the sealed
+payload, on the same open HID connection. A proof is consumed once; failed
+proofs never fall back to the legacy path. This does not authenticate a CTAP
+tunnel against a live relay involving your enrolled key.
+
+First establish TPM handles, approval authority and tested recovery as above.
+For each key separately, create and prove a public bootstrap identity:
+
+```sh
+combined-unlock-manage identity-enroll --output primary-public.json
+# Disconnect the primary; attach the backup, then:
+combined-unlock-manage identity-enroll --output backup-public.json
+```
+
+The default proof is silent (`up=false`, `uv=false`); credential creation still
+requires touch. Use `--proof-touch` if the device requires/you want touch for the
+bootstrap assertion as well. There is no automatic policy downgrade. PIN/UV-
+requiring profiles remain unsupported. Only the ES256 algorithm is accepted.
+These public files contain bootstrap IDs and public keys, NOT unlock IDs/salts.
+They pin possession of a key enrolled through a trusted setup; this implementation
+does not yet verify manufacturer attestation or access factory device keys.
+
+Enroll each key into its own **free** LUKS slot and separate bundle, adding
+`--identity primary-public.json` or `--identity backup-public.json` to the
+existing `enroll` command. Use the same device, TPM handles/authority and profile
+for both; choose distinct bundle paths and slots. Keep the recovery slot.
+These enrollments create authenticated parameter payload version 2 (distinct
+from the unchanged TPM policy bundle versions). Guarded mode rejects legacy
+payloads; adding a public identity alone does not migrate an old enrollment.
+
+Build the one-of-N public allowlist (up to 16 keys):
+
+```sh
+combined-unlock-manage identity-policy --output identities.json \
+  --key primary primary-public.json /run/combined-unlock-esp/root/primary.json \
+  --key backup backup-public.json /run/combined-unlock-esp/root/backup.json
+```
+
+Embed that **public** JSON in the trusted signed initrd:
+
+```nix
+boot.initrd.combinedUnlock.providers.cryptroot.identityPolicy = ./identities.json;
+```
+
+The module copies it into an immutable Nix store file and includes it in initrd.
+Its per-key runtime bundle paths replace the provider's legacy `bundle` path
+when enabled. Never point the CLI's `--identity-policy` at a mutable ESP file:
+that would let an attacker replace the trusted identities. The runtime bundles
+remain public ciphertext, selected/unsealed only after a matching proof. An
+identity fingerprint inside each authenticated envelope prevents mismatching
+identities and bundles. Each entry can point to a single bundle or epoch set.
+
+`auto` still requires exactly one connected token: either primary OR backup.
+Both keys connected simultaneously require an explicit device path. Removing
+or replacing a token requires a new proof, never continuation on a reopened
+connection. Recovery remains available on any failure.
+
+Enable only after disposable-volume and signed-boot tests. Old slots or old
+approved boot images can still offer the legacy path until explicitly retired
+through the existing migration/epoch workflow; this option alone does not
+revoke them. No VM/physical root migration happens automatically. An independent
+TPM contribution to the final disk key remains a separate, unimplemented design.
+
 ## UKI profile (version 2)
 
 Enroll a distinct free slot with `enroll --profile uki`; the prior slots are
@@ -219,9 +287,17 @@ nix flake check
 # Or Python with cryptography + tpm2-pytss and swtpm on PATH:
 python3 tests/test_provider.py
 python3 tests/test_epoch_transition.py
+python3 tests/test_identity.py
 ```
 
 The test creates a fresh private swtpm, never opens a hardware TPM, and checks
 repeat unsealing without global flushes, authenticated-envelope tampering,
 revoked/new epochs, future UKI prediction approval and both phase profiles. VM boot validation belongs to the consuming
 configuration; unit policy tests cannot establish a physical trust chain.
+Identity tests use real ES256 signatures and a simulated CTAP peer for primary/
+backup selection, replay, wrong key/RP/credential, changed signatures, single-use
+proofs and no unlock requests on failed verification. The optional
+`tests/smoke_identity_vm.py` is guarded to the disposable trial and creates a
+temporary LUKS image/private swtpm plus two credential pairs on its CanoKey;
+it does not access the installed root or system TPM. One emulator with two
+credentials is not validation of two physical devices or vendor attestation.

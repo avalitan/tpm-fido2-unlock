@@ -1,11 +1,12 @@
 { pkgs }:
 let
-  python = pkgs.python3.withPackages (ps: [ ps.cryptography ps.tpm2-pytss ]);
+  python = pkgs.python3.withPackages (ps: [ ps.cryptography ps.tpm2-pytss ps.fido2 ]);
   source = pkgs.runCommand "combined-unlock-management-source" { } ''
     mkdir -p $out/lib
     cp ${../src/manage.py} $out/lib/manage.py
     cp ${../src/management.py} $out/lib/management.py
     cp ${../src/provider.py} $out/lib/provider.py
+    cp ${../src/identity.py} $out/lib/identity.py
   '';
 in pkgs.writeShellApplication {
   name = "combined-unlock-manage";

@@ -14,7 +14,7 @@
     });
     checks = forSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system};
-      python = pkgs.python3.withPackages (ps: [ ps.cryptography ps.tpm2-pytss ]);
+      python = pkgs.python3.withPackages (ps: [ ps.cryptography ps.tpm2-pytss ps.fido2 ]);
       source = nixpkgs.lib.fileset.toSource {
         root = ./.;
         fileset = nixpkgs.lib.fileset.unions [ ./src ./tests ];
@@ -26,6 +26,7 @@
         export PYTHONDONTWRITEBYTECODE=1
         python3 ${source}/tests/test_provider.py
         python3 ${source}/tests/test_epoch_transition.py
+        python3 ${source}/tests/test_identity.py
         touch $out
       '';
     });

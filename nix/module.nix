@@ -9,6 +9,10 @@ let
   cryptUnits = map (name: "systemd-cryptsetup@${utils.escapeSystemdPath name}.service") (builtins.attrNames configured);
   mount = cfg.bundleMount;
   phase = "combined-unlock-close-phase";
+  identityPolicies = lib.mapAttrs (name: value:
+    if value.identityPolicy == null then null else
+      pkgs.writeText "combined-unlock-${name}-identities.json" (builtins.readFile value.identityPolicy)
+  ) cfg.providers;
 in {
   options.boot.initrd.combinedUnlock = {
     enable = lib.mkEnableOption "experimental combined TPM-policy and FIDO2 unlocking";
@@ -35,6 +39,11 @@ in {
             type = lib.types.str;
             default = "auto";
             description = "FIDO2 device path, or auto when exactly one token is connected.";
+          };
+          identityPolicy = lib.mkOption {
+            type = lib.types.nullOr lib.types.path;
+            default = null;
+            description = "PUBLIC identity allowlist copied into the Nix store/signed initrd. Entries map primary/backup verification keys to runtime bundles. Never include unlock salts or secret credential IDs.";
           };
         };
       });
@@ -83,7 +92,8 @@ in {
     boot.initrd.systemd.storePaths = [
       package package.python pkgs.python3 pkgs.libfido2 pkgs.cryptsetup
       "${../src/provider.py}" "${../src/phase.py}"
-    ] ++ lib.optional (mount != null) pkgs.util-linux;
+    ] ++ lib.optional (mount != null) pkgs.util-linux
+      ++ lib.filter (value: value != null) (builtins.attrValues identityPolicies);
     boot.initrd.systemd.mounts = lib.optional (mount != null) {
       what = mount.device;
       where = mount.mountPoint;
@@ -115,7 +125,9 @@ in {
         serviceConfig = {
           Type = "oneshot";
           ExecStart = lib.escapeShellArgs [ "${package}/bin/combined-unlock" value.bundle
-            "--socket-activated" "--device" value.fido2Device ];
+            "--socket-activated" "--device" value.fido2Device ]
+            + lib.optionalString (value.identityPolicy != null)
+              (" --identity-policy " + lib.escapeShellArg (toString identityPolicies.${name}));
           TimeoutStartSec = cfg.keyTimeout + 10;
           UMask = "0077";
           LimitCORE = 0;

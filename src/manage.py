@@ -12,6 +12,7 @@ from tpm2_pytss import ESAPI, TPM2_CAP
 
 import management
 import provider
+import identity
 
 
 def atomic_bundle(path, bundle):
@@ -38,6 +39,15 @@ def parser():
     sub = result.add_subparsers(dest='command', required=True)
     keygen = sub.add_parser('keygen', help='Create a new approval private key; never overwrites')
     keygen.add_argument('--authority', type=Path, required=True)
+    identity_enroll = sub.add_parser('identity-enroll', help='Create and prove a PUBLIC bootstrap credential; no TPM/LUKS changes')
+    identity_enroll.add_argument('--output', type=Path, required=True)
+    identity_enroll.add_argument('--fido2-device', default='auto')
+    identity_enroll.add_argument('--rp', default='io.github.tpm-fido2-unlock.identity')
+    identity_enroll.add_argument('--proof-touch', action='store_true', help='Require touch for the identity proof as well as unlock')
+    identity_policy = sub.add_parser('identity-policy', help='Assemble a PUBLIC allowlist for embedding in the signed initrd')
+    identity_policy.add_argument('--output', type=Path, required=True)
+    identity_policy.add_argument('--key', nargs=3, action='append', required=True,
+                                 metavar=('NAME', 'IDENTITY_JSON', 'BUNDLE'))
     provision = sub.add_parser('provision', help='Reserve a counter/parent using EXISTING protected owner auth')
     provision.add_argument('--owner-auth-file', type=Path, required=True)
     provision.add_argument('--index', type=lambda value: int(value, 0), default=management.INDEX)
@@ -56,6 +66,7 @@ def parser():
     enroll.add_argument('--pcrs', default=provider.PCRS)
     enroll.add_argument('--profile', choices=['legacy', 'uki'], default='legacy')
     enroll.add_argument('--next-epoch', action='store_true', help='Stage the immediately next UKI epoch without advancing NV')
+    enroll.add_argument('--identity', type=Path, help='Require this previously enrolled public identity before creating the unlock credential')
     approve = sub.add_parser('approve', help='Explicitly sign the current measured state in the bundle epoch')
     approve.add_argument('--bundle', type=Path, required=True)
     approve.add_argument('--authority', type=Path, required=True)
@@ -73,6 +84,24 @@ def main():
             handle.write(key.private_bytes(serialization.Encoding.PEM,
                 serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
         print('Created approval key. Keep it outside the initrd and Nix store.')
+        return
+    if args.command in ('identity-enroll', 'identity-policy'):
+        if args.output.exists() or args.output.with_name(args.output.name + '.new').exists():
+            raise ValueError('Identity output already exists; refusing replacement')
+        if args.command == 'identity-enroll':
+            with identity.Token(provider.select_token(args.fido2_device)) as token:
+                record = token.create(args.rp)
+                record['presence'] = args.proof_touch
+                token.prove(record)
+            atomic_bundle(args.output, record)
+            print('Public verification identity created and proved; no TPM/LUKS changes.')
+        else:
+            policy = dict(version=1, keys=[dict(name=name,
+                identity=identity.read_json(path), bundle=bundle)
+                for name, path, bundle in args.key])
+            identity.validate_policy(policy)
+            atomic_bundle(args.output, policy)
+            print('Public allowlist written. Embed it in the signed initrd; do not trust a mutable copy.')
         return
     if os.geteuid():
         raise SystemExit('TPM and LUKS management requires root')
@@ -147,12 +176,24 @@ def main():
         template = dict(version=1, presence=True, pin=False, uv=False, rp=args.rp,
                         credential=provider.encode(b'test'), salt=provider.encode(bytes(32)))
         provider.validate_parameters(template)
-        request = '\n'.join([provider.encode(secrets.token_bytes(32)), args.rp,
-                             'encrypted-volume', provider.encode(secrets.token_bytes(32)), ''])
-        attestation = provider.run('fido2-cred', '-M', '-h', '-q', token, data=request.encode())
-        verified = provider.run('fido2-cred', '-V', '-h', data=attestation).splitlines()
-        params = dict(template, credential=verified[0].decode(), salt=provider.encode(secrets.token_bytes(32)))
-        key = provider.derive_key(params, token)
+        if args.identity:
+            record = identity.read_json(args.identity)
+            identity.validate_identity(record)
+            with identity.Token(token) as connection:
+                connection.prove(record)
+                unlock = connection.create(args.rp, hmac_secret=True)
+                params = dict(template, version=2, identity=identity.fingerprint(record),
+                    public_key=unlock['public_key'], credential=unlock['credential'],
+                    salt=provider.encode(secrets.token_bytes(32)))
+                provider.validate_parameters(params)
+                key = connection.unlock(params)
+        else:
+            request = '\n'.join([provider.encode(secrets.token_bytes(32)), args.rp,
+                                 'encrypted-volume', provider.encode(secrets.token_bytes(32)), ''])
+            attestation = provider.run('fido2-cred', '-M', '-h', '-q', token, data=request.encode())
+            verified = provider.run('fido2-cred', '-V', '-h', data=attestation).splitlines()
+            params = dict(template, credential=verified[0].decode(), salt=provider.encode(secrets.token_bytes(32)))
+            key = provider.derive_key(params, token)
         # Seal before slot mutation; no plaintext wrapping-key artifact is retained.
         bundle = management.seal(tpm, index, parent, params, authority,
                                  'sha256:4,7,11' if args.profile == 'uki' else args.pcrs, args.profile,

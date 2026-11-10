@@ -105,7 +105,8 @@ in {
         config.boot.initrd.luks.devices.${name}.crypttabExtraOpts;
       message = "Remove standalone token crypttab options from combinedUnlock device ${name}.";
     }) managedNames;
-    boot.initrd.systemd.enable = true;
+    # From NixOS 26.11 onward all initrds use systemd and this option is removed.
+    boot.initrd.systemd.enable = lib.mkIf (lib.versionOlder config.system.nixos.release "26.11") true;
     boot.initrd.availableKernelModules = [ "tpm_crb" "tpm_tis" "usbhid" "hid_generic" ]
       ++ lib.optionals (mount != null && mount.fsType == "vfat") [ "vfat" "nls_cp437" "nls_iso8859_1" ];
     boot.initrd.systemd.storePaths = [
